@@ -1,0 +1,69 @@
+name: ImmortalWrt-25.12-SingleThread
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection'
+        required: false
+        default: 'false'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-24.10
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Cleanup Space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install $(curl -fsSL https://raw.githubusercontent.com/P3TERX/Actions-OpenWrt/main/setup-ubuntu-2204)
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+
+    - name: Clone source code
+      run: |
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf openwrt/bin $GITHUB_WORKSPACE/bin
+
+    - name: Update & Install Feeds
+      run: |
+        chmod +x diy-part1.sh
+        ./diy-part1.sh
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Load Config & DIY2
+      run: |
+        [ -e .config ] && cp .config openwrt/.config
+        chmod +x diy-part2.sh
+        ./diy-part2.sh
+
+    - name: SSH connection to Actions
+      uses: P3TERX/ssh2actions@main
+      if: github.event.inputs.ssh == 'true'
+
+    - name: Download & Compile (Single-Thread)
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        echo "Starting Single-Thread Compile..."
+        make -j1 V=s
+
+    - name: Upload firmware
+      uses: softprops/action-gh-release@v2
+      if: success()
+      with:
+        tag_name: ImmortalWrt_${{ github.run_id }}
+        files: openwrt/bin/targets/x86/64/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
