@@ -4,11 +4,9 @@ on:
   workflow_dispatch:
 
 env:
-  REPO_URL: https://github.com/immortalwrt/immortalwrt
-  REPO_BRANCH: openwrt-24.10
-  FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
-  DIY_SH: diy.sh
+  # 使用绝对路径定义工作目录
+  BUILD_DIR: /workdir/immortalwrt
+  CONFIG_FILE: /workdir/immortalwrt/.config
 
 jobs:
   build:
@@ -17,14 +15,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 释放磁盘空间 (避免 No space left)
+      - name: 释放磁盘空间 (修正参数以避免报错)
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
           android: true
           dotnet: true
           haskell: true
-          swap: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true # 修正原 swap 报错
 
       - name: 初始化编译环境
         env:
@@ -37,35 +37,33 @@ jobs:
           sudo mkdir -p /workdir
           sudo chown $USER:$GROUPS /workdir
 
-      - name: 克隆源码
-        working-directory: /workdir
+      - name: 克隆源码 (绝对路径)
         run: |
-          git clone --depth 1 $REPO_URL -b $REPO_BRANCH immortalwrt
-          ln -sf /workdir/immortalwrt $GITHUB_WORKSPACE/immortalwrt
+          cd /workdir
+          git clone --depth 1 https://github.com/immortalwrt/immortalwrt -b openwrt-24.10 immortalwrt
 
-      - name: 更新与安装 Feeds (处理源冲突)
-        working-directory: /workdir/immortalwrt
+      - name: 更新与安装 Feeds (规避 Multiple packages define 冲突)
         run: |
+          cd ${{ env.BUILD_DIR }}
           ./scripts/feeds update -a
-          # 如下载失败提示 Hash Mismatch，此处会报错。
-          # 预先删除可能冲突的重复包
+          # 预先清理可能导致冲突的重复包路径（SmartDNS 冲突高发区）
           rm -rf feeds/packages/net/smartdns
           rm -rf feeds/luci/applications/luci-app-smartdns
           ./scripts/feeds install -a
 
-      - name: 自定义配置 (2G空间/插件/IPv6)
-        working-directory: /workdir/immortalwrt
+      - name: 生成自定义配置 (2G 空间及插件)
         run: |
-          # 设置 x86-64 架构
+          cd ${{ env.BUILD_DIR }}
+          # 基础架构
           echo "CONFIG_TARGET_x86=y" >> .config
           echo "CONFIG_TARGET_x86_64=y" >> .config
           echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
           
-          # 核心：设置 2G 剩余空间 (Rootfs 分区设为 2560MB)
+          # 核心空间设置：Rootfs 2.5G 确保空闲空间 > 2G
           echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
           echo "CONFIG_TARGET_ROOTFS_PARTSIZE=2560" >> .config
           
-          # 插件集成
+          # 插件集成 (y 代表内置)
           echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-smartdns=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-mwan3=y" >> .config
@@ -73,28 +71,32 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
           echo "CONFIG_PACKAGE_ddns-scripts-cloudflare=y" >> .config
           
-          # IPv6 支持
+          # IPv6 与基础依赖
           echo "CONFIG_PACKAGE_ipv6helper=y" >> .config
+          echo "CONFIG_PACKAGE_curl=y" >> .config
+          echo "CONFIG_PACKAGE_ca-bundle=y" >> .config
           
-          # 补全依赖并检查
           make defconfig
 
-      - name: 下载软件包 (预下载防止 Hash Mismatch)
-        working-directory: /workdir/immortalwrt
+      - name: 下载软件包 (处理 Hash Mismatch)
         run: |
+          cd ${{ env.BUILD_DIR }}
+          # 第一次尝试多线程下载
           make download -j8 || make download -j1 V=s
+          # 检查并删除下载失败的 0 字节或损坏文件 (通常小于 1k)
           find dl -size -1k -exec ls -l {} \;
           find dl -size -1k -exec rm -f {} \;
+          # 再次尝试下载被删除的损坏包
+          make download -j1 V=s
 
-      - name: 编译固件 (单线程模式规避 Code 2)
-        working-directory: /workdir/immortalwrt
+      - name: 编译固件 (规避 Code 2)
         run: |
-          # 默认先尝试多线程加速
+          cd ${{ env.BUILD_DIR }}
+          # 尝试多线程编译，若失败自动切入单线程 V=s 模式
           make -j$(nproc) || make -j1 V=s
-          echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-      - name: 上传固件
+      - name: 归档固件
         uses: actions/upload-artifact@v4
         with:
-          name: ImmortalWrt_x86_64_Fixed
-          path: /workdir/immortalwrt/bin/targets/x86/64/*-combined-efi.img.gz
+          name: ImmortalWrt_24.10_x86_64
+          path: ${{ env.BUILD_DIR }}/bin/targets/x86/64/*-combined-efi.img.gz
