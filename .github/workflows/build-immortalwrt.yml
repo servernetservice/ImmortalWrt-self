@@ -61,7 +61,7 @@ jobs:
           
           # 核心空间设置：Rootfs 2.5G 确保空闲空间 > 2G
           echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
-          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=2560" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=1536" >> .config
           
           # 插件集成 (y 代表内置)
           echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
