@@ -1,20 +1,19 @@
-name: Build OpenWrt 24.10 x86_64 500M-Free (IP 2.1)
+name: Build ImmortalWrt 24.10 (500M Free Space)
 
 on:
   workflow_dispatch:
+
+env:
+  BUILD_DIR: /workdir/immortalwrt
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout 源码
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          repository: openwrt/openwrt
-          ref: openwrt-24.10
-          fetch-depth: 1
 
-      - name: 释放空间并增加虚拟内存
+      - name: 释放磁盘空间 (解决 No space left on device)
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -29,105 +28,87 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-          gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev swig libpython3-dev \
-          libelf-dev qemu-utils
-          sudo timedatectl set-timezone "Asia/Shanghai"
+          gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev swig libpython3-dev
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
 
-      - name: 更新与安装 Feeds
+      - name: 克隆源码 (24.10)
         run: |
-          # 注入第三方源
-          echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> feeds.conf.default
-          echo "src-git passwall_luci https://github.com/xiaorouji/openwrt-passwall.git;main" >> feeds.conf.default
-          echo "src-git small8 https://github.com/kenzok8/small-package.git;main" >> feeds.conf.default
+          cd /workdir
+          git clone --depth 1 https://github.com/immortalwrt/immortalwrt -b openwrt-24.10 immortalwrt
+
+      - name: 添加第三方源 (包含 syncdial 与 ADG)
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          # 添加高兼容性插件源
+          echo "src-git kenzo https://github.com/kenzok8/openwrt-packages" >> feeds.conf.default
+          echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
           
           ./scripts/feeds update -a
-          # 清理冲突插件
-          rm -rf feeds/small8/luci-app-passwall
-          rm -rf feeds/small8/luci-app-smartdns
-          rm -rf feeds/small8/luci-app-adguardhome
-          rm -rf feeds/small8/mwan3
-          ./scripts/feeds install -a -f
-
-      - name: 预配置系统参数 (IP & 自动网口)
-        run: |
-          # 1. 修改默认 IP
-          sed -i 's/192.168.1.1/192.168.2.1/g' package/base-files/files/bin/config_generate
           
-          # 2. 注入网口自动识别脚本
-          mkdir -p files/etc/uci-defaults
-          cat <<EOF > files/etc/uci-defaults/99-custom-network
-          IFACES=\$(ls /sys/class/net | grep -E 'eth|enp|eno' | grep -v 'lo' | sort)
-          if [ -n "\$IFACES" ]; then
-              LAN_DEV=\$(echo "\$IFACES" | head -n 1)
-              uci set network.lan.device="\$LAN_DEV"
-              WAN_DEV=\$(echo "\$IFACES" | sed -n '2p')
-              if [ -n "\$WAN_DEV" ]; then
-                  uci set network.wan.device="\$WAN_DEV"
-                  uci set network.wan.proto='dhcp'
-                  uci set network.wan6.device="\$WAN_DEV"
-                  uci set network.wan6.proto='dhcpv6'
-              fi
-              uci commit network
-          fi
-          EOF
+          # 核心：解决 Multiple packages define (源冲突)
+          # 显式删除官方源中冲突的旧包，确保编译使用第三方源的新包
+          rm -rf feeds/packages/net/smartdns
+          rm -rf feeds/luci/applications/luci-app-smartdns
+          rm -rf feeds/packages/net/adguardhome
+          rm -rf feeds/luci/applications/luci-app-passwall
+          
+          ./scripts/feeds install -a
 
-      - name: 生成全驱动 .config 文件
+      - name: 生成自定义配置 (500M空间+网卡驱动)
         run: |
-          # 架构
+          cd ${{ env.BUILD_DIR }}
+          # 1. 架构与输出格式 (Generic + EFI)
           echo "CONFIG_TARGET_x86=y" >> .config
           echo "CONFIG_TARGET_x86_64=y" >> .config
           echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
+          echo "CONFIG_GRUB_IMAGES=y" >> .config
+          echo "CONFIG_GRUB_EFI_IMAGES=y" >> .config
           
-          # --- 关键空间设置 ---
-          # 引导分区 64MB
+          # 2. 空间设置：Rootfs 1024MB 确保空闲约 500MB
           echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
-          # 根分区设置为 768MB (系统占 ~150M，空闲约 500-600M)
-          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=768" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=1024" >> .config
           
-          # --- 有线网卡驱动 (含 e1000) ---
+          # 3. 指定插件集成
+          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-smartdns=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-adguardhome=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-mwan3=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-syncdial=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
+          echo "CONFIG_PACKAGE_ddns-scripts-cloudflare=y" >> .config
+          
+          # 4. 网卡驱动 (e1000/e1000e/igb/igc)
           echo "CONFIG_PACKAGE_kmod-e1000=y" >> .config
           echo "CONFIG_PACKAGE_kmod-e1000e=y" >> .config
           echo "CONFIG_PACKAGE_kmod-igb=y" >> .config
           echo "CONFIG_PACKAGE_kmod-igc=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-r8169=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-r8125=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-virtio-net=y" >> .config
           
-          # --- 常用插件 ---
-          echo "CONFIG_PACKAGE_luci=y" >> .config
-          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-adguardhome=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-smartdns=y" >> .config
-          echo "CONFIG_PACKAGE_autocore=y" >> .config
+          # 5. IPv6 辅助包与证书依赖
+          echo "CONFIG_PACKAGE_ipv6helper=y" >> .config
+          echo "CONFIG_PACKAGE_curl=y" >> .config
+          echo "CONFIG_PACKAGE_ca-bundle=y" >> .config
           
           make defconfig
 
-      - name: 下载软件包
+      - name: 下载包 (解决 Hash mismatch)
         run: |
-          make download -j8 || true
+          cd ${{ env.BUILD_DIR }}
+          make download -j8 || make download -j1 V=s
+          # 自动清理损坏的 0 字节文件并重试
           find dl -size -1k -exec rm -f {} \;
           make download -j1 V=s
 
-      - name: 编译固件
+      - name: 编译 (解决 Code 2，单线程容错)
         run: |
-          make tools/install -j$(nproc) || make tools/install -j1 V=s
-          make toolchain/install -j$(nproc) || make toolchain/install -j1 V=s
-          make target/compile -j$(nproc) || make target/compile -j1 V=s
-          make package/compile -j$(nproc) || make package/compile -j1 V=s
-          make package/install -j$(nproc) || make package/install -j1 V=s
-          make target/install -j$(nproc) || make target/install -j1 V=s
+          cd ${{ env.BUILD_DIR }}
+          # 默认并发编译，若报错自动转单线程并显示详细日志
+          make -j$(nproc) || make -j1 V=s
 
-      - name: 整理镜像文件
-        if: always()
-        run: |
-          mkdir -p ./output
-          find bin/targets/x86/64/ -name "*.img.gz" -exec cp {} ./output/ \;
-          cp .config ./output/build.config
-          ls -lh ./output/
-
-      - name: 上传固件
+      - name: 归档上传
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt_24.10_500M_Free
-          path: ./output/*
+          name: ImmortalWrt_24.10_x86_64_500M
+          path: |
+            ${{ env.BUILD_DIR }}/bin/targets/x86/64/*-combined.img.gz
+            ${{ env.BUILD_DIR }}/bin/targets/x86/64/*-combined-efi.img.gz
