@@ -1,0 +1,114 @@
+name: Build ImmortalWrt 24.10 Final (Add Feeds)
+
+on:
+  workflow_dispatch:
+
+env:
+  BUILD_DIR: /workdir/immortalwrt
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: 环境初始化
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev swig libpython3-dev
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
+
+      - name: 克隆源码 (24.10)
+        run: |
+          cd /workdir
+          git clone --depth 1 https://github.com/immortalwrt/immortalwrt -b openwrt-24.10 immortalwrt
+
+      - name: 添加第三方源 (解决 syncdial/adg 缺失)
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          # 添加常用的插件源（包含 syncdial 和最新版 adg）
+          echo "src-git kenzo https://github.com/kenzok8/openwrt-packages" >> feeds.conf.default
+          echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
+          
+          ./scripts/feeds update -a
+          
+          # 规避 Multiple packages define (源冲突) - 必须删除重复的包路径
+          # 优先使用第三方源的插件，删除官方 feeds 里的同名冲突包
+          rm -rf feeds/packages/net/smartdns
+          rm -rf feeds/luci/applications/luci-app-smartdns
+          rm -rf feeds/packages/net/adguardhome
+          rm -rf feeds/luci/applications/luci-app-passwall
+          
+          ./scripts/feeds install -a
+
+      - name: 生成自定义配置 (绝对路径驱动与插件)
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          # 架构与格式
+          echo "CONFIG_TARGET_x86=y" >> .config
+          echo "CONFIG_TARGET_x86_64=y" >> .config
+          echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
+          echo "CONFIG_GRUB_IMAGES=y" >> .config
+          echo "CONFIG_GRUB_EFI_IMAGES=y" >> .config
+          
+          # 分区设置 (1.5GB -> 1GB Overlay)
+          echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=1536" >> .config
+          
+          # 核心插件 (显式选中)
+          echo "CONFIG_PACKAGE_luci-app-adguardhome=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-syncdial=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-smartdns=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-mwan3=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
+          echo "CONFIG_PACKAGE_ddns-scripts-cloudflare=y" >> .config
+          
+          # 网卡驱动 (e1000系列)
+          echo "CONFIG_PACKAGE_kmod-e1000=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-e1000e=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-igb=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-igc=y" >> .config
+          
+          # 基础依赖与 IPv6
+          echo "CONFIG_PACKAGE_ipv6helper=y" >> .config
+          echo "CONFIG_PACKAGE_curl=y" >> .config
+          echo "CONFIG_PACKAGE_ca-bundle=y" >> .config
+          
+          make defconfig
+
+      - name: 下载包 (处理 Hash Mismatch)
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          # 预下载，失败则尝试单线程详细输出
+          make download -j8 || make download -j1 V=s
+          find dl -size -1k -exec rm -f {} \;
+          make download -j1 V=s
+
+      - name: 编译固件 (CODE 2 自动规避)
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          # 先尝试满载多线程，失败则转为单线程编译
+          make -j$(nproc) || make -j1 V=s
+
+      - name: 上传归档
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt_24.10_x86_Full_v2
+          path: |
+            ${{ env.BUILD_DIR }}/bin/targets/x86/64/*-combined.img.gz
+            ${{ env.BUILD_DIR }}/bin/targets/x86/64/*-combined-efi.img.gz
