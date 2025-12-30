@@ -1,0 +1,133 @@
+name: Build OpenWrt 24.10 x86_64 500M-Free (IP 2.1)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v4
+        with:
+          repository: openwrt/openwrt
+          ref: openwrt-24.10
+          fetch-depth: 1
+
+      - name: 释放空间并增加虚拟内存
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: 初始化编译环境
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev swig libpython3-dev \
+          libelf-dev qemu-utils
+          sudo timedatectl set-timezone "Asia/Shanghai"
+
+      - name: 更新与安装 Feeds
+        run: |
+          # 注入第三方源
+          echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> feeds.conf.default
+          echo "src-git passwall_luci https://github.com/xiaorouji/openwrt-passwall.git;main" >> feeds.conf.default
+          echo "src-git small8 https://github.com/kenzok8/small-package.git;main" >> feeds.conf.default
+          
+          ./scripts/feeds update -a
+          # 清理冲突插件
+          rm -rf feeds/small8/luci-app-passwall
+          rm -rf feeds/small8/luci-app-smartdns
+          rm -rf feeds/small8/luci-app-adguardhome
+          rm -rf feeds/small8/mwan3
+          ./scripts/feeds install -a -f
+
+      - name: 预配置系统参数 (IP & 自动网口)
+        run: |
+          # 1. 修改默认 IP
+          sed -i 's/192.168.1.1/192.168.2.1/g' package/base-files/files/bin/config_generate
+          
+          # 2. 注入网口自动识别脚本
+          mkdir -p files/etc/uci-defaults
+          cat <<EOF > files/etc/uci-defaults/99-custom-network
+          IFACES=\$(ls /sys/class/net | grep -E 'eth|enp|eno' | grep -v 'lo' | sort)
+          if [ -n "\$IFACES" ]; then
+              LAN_DEV=\$(echo "\$IFACES" | head -n 1)
+              uci set network.lan.device="\$LAN_DEV"
+              WAN_DEV=\$(echo "\$IFACES" | sed -n '2p')
+              if [ -n "\$WAN_DEV" ]; then
+                  uci set network.wan.device="\$WAN_DEV"
+                  uci set network.wan.proto='dhcp'
+                  uci set network.wan6.device="\$WAN_DEV"
+                  uci set network.wan6.proto='dhcpv6'
+              fi
+              uci commit network
+          fi
+          EOF
+
+      - name: 生成全驱动 .config 文件
+        run: |
+          # 架构
+          echo "CONFIG_TARGET_x86=y" >> .config
+          echo "CONFIG_TARGET_x86_64=y" >> .config
+          echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
+          
+          # --- 关键空间设置 ---
+          # 引导分区 64MB
+          echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
+          # 根分区设置为 768MB (系统占 ~150M，空闲约 500-600M)
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=768" >> .config
+          
+          # --- 有线网卡驱动 (含 e1000) ---
+          echo "CONFIG_PACKAGE_kmod-e1000=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-e1000e=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-igb=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-igc=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-r8169=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-r8125=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-virtio-net=y" >> .config
+          
+          # --- 常用插件 ---
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-adguardhome=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-smartdns=y" >> .config
+          echo "CONFIG_PACKAGE_autocore=y" >> .config
+          
+          make defconfig
+
+      - name: 下载软件包
+        run: |
+          make download -j8 || true
+          find dl -size -1k -exec rm -f {} \;
+          make download -j1 V=s
+
+      - name: 编译固件
+        run: |
+          make tools/install -j$(nproc) || make tools/install -j1 V=s
+          make toolchain/install -j$(nproc) || make toolchain/install -j1 V=s
+          make target/compile -j$(nproc) || make target/compile -j1 V=s
+          make package/compile -j$(nproc) || make package/compile -j1 V=s
+          make package/install -j$(nproc) || make package/install -j1 V=s
+          make target/install -j$(nproc) || make target/install -j1 V=s
+
+      - name: 整理镜像文件
+        if: always()
+        run: |
+          mkdir -p ./output
+          find bin/targets/x86/64/ -name "*.img.gz" -exec cp {} ./output/ \;
+          cp .config ./output/build.config
+          ls -lh ./output/
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_24.10_500M_Free
+          path: ./output/*
