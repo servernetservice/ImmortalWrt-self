@@ -1,114 +1,67 @@
-name: Build ImmortalWrt 24.10 (500M Free Space)
-
-on:
-  workflow_dispatch:
-
-env:
-  BUILD_DIR: /workdir/immortalwrt
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: 释放磁盘空间 (解决 No space left on device)
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: 初始化编译环境
+- name: 添加第三方源并强制解决冲突
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-          gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev swig libpython3-dev
-          sudo mkdir -p /workdir
-          sudo chown $USER:$GROUPS /workdir
-
-      - name: 克隆源码 (24.10)
-        run: |
-          cd /workdir
-          git clone --depth 1 https://github.com/immortalwrt/immortalwrt -b openwrt-24.10 immortalwrt
-
-      - name: 添加第三方源 (包含 syncdial 与 ADG)
-        run: |
-          cd ${{ env.BUILD_DIR }}
-          # 添加高兼容性插件源
+          cd /workdir/immortalwrt
+          # 注入源
           echo "src-git kenzo https://github.com/kenzok8/openwrt-packages" >> feeds.conf.default
           echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
           
           ./scripts/feeds update -a
           
-          # 核心：解决 Multiple packages define (源冲突)
-          # 显式删除官方源中冲突的旧包，确保编译使用第三方源的新包
+          # 深度清理：防止 Multiple packages define
+          # 重点删除官方源中与 kenzo 源冲突的包
+          rm -rf feeds/packages/lang/golang
           rm -rf feeds/packages/net/smartdns
-          rm -rf feeds/luci/applications/luci-app-smartdns
           rm -rf feeds/packages/net/adguardhome
+          rm -rf feeds/luci/applications/luci-app-smartdns
           rm -rf feeds/luci/applications/luci-app-passwall
+          rm -rf feeds/luci/applications/luci-app-adguardhome
           
           ./scripts/feeds install -a
 
-      - name: 生成自定义配置 (500M空间+网卡驱动)
+      - name: 预配置阶段 (修正 Code 2)
         run: |
-          cd ${{ env.BUILD_DIR }}
-          # 1. 架构与输出格式 (Generic + EFI)
-          echo "CONFIG_TARGET_x86=y" >> .config
-          echo "CONFIG_TARGET_x86_64=y" >> .config
-          echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
-          echo "CONFIG_GRUB_IMAGES=y" >> .config
-          echo "CONFIG_GRUB_EFI_IMAGES=y" >> .config
+          cd /workdir/immortalwrt
+          # 强制指定 Golang 版本（某些插件需要）
+          sed -i 's/20.03/24.10/g' .config || true
           
-          # 2. 空间设置：Rootfs 1024MB 确保空闲约 500MB
-          echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
-          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=1024" >> .config
+          # 写入配置 (500M 空间等)
+          cat >> .config <<EOF
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          CONFIG_GRUB_IMAGES=y
+          CONFIG_GRUB_EFI_IMAGES=y
+          CONFIG_TARGET_KERNEL_PARTSIZE=64
+          CONFIG_TARGET_ROOTFS_PARTSIZE=1024
+          CONFIG_PACKAGE_luci-app-passwall=y
+          CONFIG_PACKAGE_luci-app-smartdns=y
+          CONFIG_PACKAGE_luci-app-adguardhome=y
+          CONFIG_PACKAGE_luci-app-mwan3=y
+          CONFIG_PACKAGE_luci-app-syncdial=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+          CONFIG_PACKAGE_kmod-e1000=y
+          CONFIG_PACKAGE_kmod-e1000e=y
+          CONFIG_PACKAGE_kmod-igb=y
+          CONFIG_PACKAGE_kmod-igc=y
+          CONFIG_PACKAGE_ipv6helper=y
+          EOF
           
-          # 3. 指定插件集成
-          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-smartdns=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-adguardhome=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-mwan3=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-syncdial=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
-          echo "CONFIG_PACKAGE_ddns-scripts-cloudflare=y" >> .config
-          
-          # 4. 网卡驱动 (e1000/e1000e/igb/igc)
-          echo "CONFIG_PACKAGE_kmod-e1000=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-e1000e=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-igb=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-igc=y" >> .config
-          
-          # 5. IPv6 辅助包与证书依赖
-          echo "CONFIG_PACKAGE_ipv6helper=y" >> .config
-          echo "CONFIG_PACKAGE_curl=y" >> .config
-          echo "CONFIG_PACKAGE_ca-bundle=y" >> .config
-          
+          # 核心步骤：修正依赖关系
           make defconfig
 
-      - name: 下载包 (解决 Hash mismatch)
+      - name: 强制校验下载 (解决 Hash Mismatch)
         run: |
-          cd ${{ env.BUILD_DIR }}
-          make download -j8 || make download -j1 V=s
-          # 自动清理损坏的 0 字节文件并重试
+          cd /workdir/immortalwrt
+          # 预先下载所有源码包
+          make download -j8
+          # 检查并删除 1k 以下的残损包，防止 Code 2
           find dl -size -1k -exec rm -f {} \;
+          # 补充下载
           make download -j1 V=s
 
-      - name: 编译 (解决 Code 2，单线程容错)
+      - name: 编译 (单线程保底)
         run: |
-          cd ${{ env.BUILD_DIR }}
-          # 默认并发编译，若报错自动转单线程并显示详细日志
+          cd /workdir/immortalwrt
+          # 如果多线程失败，强制单线程运行并输出错误位置
           make -j$(nproc) || make -j1 V=s
-
-      - name: 归档上传
-        uses: actions/upload-artifact@v4
-        with:
-          name: ImmortalWrt_24.10_x86_64_500M
-          path: |
-            ${{ env.BUILD_DIR }}/bin/targets/x86/64/*-combined.img.gz
-            ${{ env.BUILD_DIR }}/bin/targets/x86/64/*-combined-efi.img.gz
