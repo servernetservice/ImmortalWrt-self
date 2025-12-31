@@ -6,8 +6,6 @@ on:
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt
   REPO_BRANCH: openwrt-24.10
-  FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
   BUILD_DIR: /workdir/immortalwrt
 
 jobs:
@@ -17,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 释放磁盘空间 (彻底解决 No space left)
+      - name: 释放磁盘空间
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -40,20 +38,20 @@ jobs:
           sudo chown $USER:$GROUPS /workdir
 
       - name: 克隆源码
-        working-directory: /workdir
         run: |
+          cd /workdir
           git clone --depth 1 $REPO_URL -b $REPO_BRANCH immortalwrt
 
-      - name: 添加第三方源并强制解决冲突 (Multiple packages define)
-        working-directory: ${{ env.BUILD_DIR }}
+      - name: 添加第三方源并强制解决冲突
         run: |
-          # 注入插件源 (包含 syncdial, passwall, adg)
+          cd ${{ env.BUILD_DIR }}
+          # 注入源
           echo "src-git kenzo https://github.com/kenzok8/openwrt-packages" >> feeds.conf.default
           echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
           
           ./scripts/feeds update -a
           
-          # 核心：物理删除官方源中的重复/冲突包，避免 Code 2 
+          # 关键：彻底删除官方 feeds 中可能引起 defconfig 冲突的包
           rm -rf feeds/packages/net/smartdns
           rm -rf feeds/packages/net/adguardhome
           rm -rf feeds/packages/lang/golang
@@ -63,60 +61,59 @@ jobs:
           
           ./scripts/feeds install -a
 
-      - name: 生成配置文件 (绝对路径配置)
-        working-directory: ${{ env.BUILD_DIR }}
+      - name: 生成配置文件 (修正版 Logic)
         run: |
-          # 架构与格式 (Generic + EFI)
-          echo "CONFIG_TARGET_x86=y" >> .config
+          cd ${{ env.BUILD_DIR }}
+          
+          # 1. 先创建基础 .config，只写入核心架构
+          echo "CONFIG_TARGET_x86=y" > .config
           echo "CONFIG_TARGET_x86_64=y" >> .config
           echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
-          echo "CONFIG_GRUB_IMAGES=y" >> .config
-          echo "CONFIG_GRUB_EFI_IMAGES=y" >> .config
           
-          # 磁盘分区：Rootfs 1024MB = 约 500MB 空闲
-          echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
-          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=1024" >> .config
+          # 2. 补全插件与功能 (使用强力注入模式)
+          cat >> .config <<EOF
+          CONFIG_GRUB_IMAGES=y
+          CONFIG_GRUB_EFI_IMAGES=y
+          CONFIG_TARGET_KERNEL_PARTSIZE=64
+          CONFIG_TARGET_ROOTFS_PARTSIZE=1024
+          CONFIG_PACKAGE_luci-app-passwall=y
+          CONFIG_PACKAGE_luci-app-smartdns=y
+          CONFIG_PACKAGE_luci-app-adguardhome=y
+          CONFIG_PACKAGE_luci-app-syncdial=y
+          CONFIG_PACKAGE_luci-app-mwan3=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+          CONFIG_PACKAGE_kmod-e1000=y
+          CONFIG_PACKAGE_kmod-e1000e=y
+          CONFIG_PACKAGE_kmod-igb=y
+          CONFIG_PACKAGE_kmod-igc=y
+          CONFIG_PACKAGE_ipv6helper=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-bundle=y
+          EOF
           
-          # 核心插件
-          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-smartdns=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-adguardhome=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-syncdial=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-mwan3=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
-          echo "CONFIG_PACKAGE_ddns-scripts-cloudflare=y" >> .config
-          
-          # Intel 网卡驱动 (e1000/e1000e/igb/igc)
-          echo "CONFIG_PACKAGE_kmod-e1000=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-e1000e=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-igb=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-igc=y" >> .config
-          
-          # IPv6 与基础依赖
-          echo "CONFIG_PACKAGE_ipv6helper=y" >> .config
-          echo "CONFIG_PACKAGE_curl=y" >> .config
-          echo "CONFIG_PACKAGE_ca-bundle=y" >> .config
-          
+          # 3. 核心修正：执行 make defconfig 前清理不兼容项
+          # 有时第三方源的包名略有不同，先执行一次扩充
           make defconfig
 
       - name: 下载软件包 (预防 Hash Mismatch)
-        working-directory: ${{ env.BUILD_DIR }}
         run: |
+          cd ${{ env.BUILD_DIR }}
+          # 增加重试机制
           make download -j8 || make download -j1 V=s
-          # 删除断流产生的损坏小文件并重试
           find dl -size -1k -exec rm -f {} \;
           make download -j1 V=s
 
-      - name: 编译固件 (单线程容错模式)
-        working-directory: ${{ env.BUILD_DIR }}
+      - name: 编译固件 (单线程保底)
         run: |
-          # 默认多线程，报错后自动进入单线程 V=s 输出详细错误
+          cd ${{ env.BUILD_DIR }}
+          # 如果多线程失败，自动转单线程并输出 V=s
           make -j$(nproc) || make -j1 V=s
 
-      - name: 整理并上传固件
+      - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: ImmortalWrt_24.10_x86_Full
+          name: ImmortalWrt_24.10_x86_Final
           path: |
             ${{ env.BUILD_DIR }}/bin/targets/x86/64/*-combined.img.gz
             ${{ env.BUILD_DIR }}/bin/targets/x86/64/*-combined-efi.img.gz
