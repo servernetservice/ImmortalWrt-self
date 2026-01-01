@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 24.10 x86_64 2
+name: Build ImmortalWrt 24.10 x86_64 Full Upload
 
 on:
   workflow_dispatch:
@@ -52,28 +52,28 @@ jobs:
         run: |
           cd ${{ env.BUILD_DIR }}
           
-          # 1. 基础架构强制指定
+          # 1. 基础架构与设备
           echo "CONFIG_TARGET_x86=y" > .config
           echo "CONFIG_TARGET_x86_64=y" >> .config
           echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
 
-          # 2. 强制开启 EFI 镜像生成
-          echo "CONFIG_GRUB_IMAGES=y" >> .config
-          echo "CONFIG_GRUB_EFI_IMAGES=y" >> .config
-          echo "CONFIG_TARGET_ROOTFS_PARTITION_EFI=y" >> .config
-          echo "CONFIG_TARGET_IMAGES_GZIP=y" >> .config
-          echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
-          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=768" >> .config
-
-          # 3. 多拨核心组件：mwan3 + syncdial (并发多拨)
-          echo "CONFIG_PACKAGE_luci-app-mwan3=y" >> .config
-          echo "CONFIG_PACKAGE_mwan3=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-syncdial=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-macvlan=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-ppp=y" >> .config
-
-          # 4. 其他核心插件与网络工具
+          # 2. 引导配置：确保 Legacy 与 EFI 全生成
           cat >> .config <<EOF
+          CONFIG_GRUB_IMAGES=y
+          CONFIG_GRUB_EFI_IMAGES=y
+          CONFIG_TARGET_ROOTFS_PARTITION_EFI=y
+          CONFIG_TARGET_IMAGES_GZIP=y
+          CONFIG_TARGET_KERNEL_PARTSIZE=64
+          CONFIG_TARGET_ROOTFS_PARTSIZE=768
+          EOF
+
+          # 3. 多拨(MWAN3 + SyncDial)及核心插件
+          cat >> .config <<EOF
+          CONFIG_PACKAGE_luci-app-mwan3=y
+          CONFIG_PACKAGE_mwan3=y
+          CONFIG_PACKAGE_luci-app-syncdial=y
+          CONFIG_PACKAGE_kmod-macvlan=y
+          CONFIG_PACKAGE_kmod-ppp=y
           CONFIG_PACKAGE_luci-app-passwall=y
           CONFIG_PACKAGE_luci-app-smartdns=y
           CONFIG_PACKAGE_luci-app-adguardhome=y
@@ -81,14 +81,13 @@ jobs:
           CONFIG_PACKAGE_ddns-scripts-cloudflare=y
           CONFIG_PACKAGE_ipv6helper=y
           CONFIG_PACKAGE_curl=y
-          CONFIG_PACKAGE_ca-bundle=y
           CONFIG_PACKAGE_nano=y
           CONFIG_PACKAGE_lsblk=y
           EOF
 
-          # 5. 关键：双重检查，防止 EFI 和 Syncdial 被 defconfig 刷掉
+          # 4. 执行 defconfig 固化配置
           make defconfig
-          # 强制补写
+          # 针对 ImmortalWrt 24.10 特性，二次强制锁定 EFI 和多拨
           echo "CONFIG_TARGET_ROOTFS_PARTITION_EFI=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-syncdial=y" >> .config
           make defconfig
@@ -104,18 +103,26 @@ jobs:
           cd ${{ env.BUILD_DIR }}
           make -j$(nproc) || make -j1 V=s
 
-      - name: 整理并归档固件
+      - name: 收集所有固件文件
         run: |
           cd ${{ env.BUILD_DIR }}/bin/targets/x86/64/
-          ls -lh
-          mkdir -p /tmp/artifact/
-          # 匹配所有包含 combined 的 img.gz 文件 (含 EFI 和 Legacy)
-          cp *combined*.img.gz /tmp/artifact/
-          cp *rootfs.tar.gz /tmp/artifact/ || true
-          echo "FIRMWARE_PATH=/tmp/artifact" >> $GITHUB_ENV
+          # 创建收集目录
+          mkdir -p /tmp/all_firmware/
+          # 拷贝所有镜像文件、内核文件、构建清单、根文件系统
+          cp -f *.img.gz /tmp/all_firmware/ || true
+          cp -f *.tar.gz /tmp/all_firmware/ || true
+          cp -f *.manifest /tmp/all_firmware/ || true
+          cp -f *.buildinfo /tmp/all_firmware/ || true
+          # 甚至包含 vmlinuz 内核（如果存在）
+          cp -f *vmlinuz* /tmp/all_firmware/ || true
+          
+          echo "FIRMWARE_PATH=/tmp/all_firmware" >> $GITHUB_ENV
+          echo "--- 已收集的文件清单 ---"
+          ls -lh /tmp/all_firmware/
 
-      - name: 上传固件
+      - name: 上传所有固件
         uses: actions/upload-artifact@v4
         with:
-          name: ImmortalWrt_24.10_x86_64_SyncDial_EFI
+          name: ImmortalWrt_24.10_x86_Full_Bundle
           path: ${{ env.FIRMWARE_PATH }}/*
+          if-no-files-found: error
