@@ -1,0 +1,121 @@
+name: Build ImmortalWrt 24.10 x86_64 2
+
+on:
+  workflow_dispatch:
+
+env:
+  BUILD_DIR: /workdir/immortalwrt
+  CONFIG_FILE: /workdir/immortalwrt/.config
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: 初始化编译环境
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev swig \
+          libpython3-dev python3-setuptools patch qemu-utils zstd libzstd-dev u-boot-tools
+          sudo timedatectl set-timezone "Asia/Shanghai"
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
+
+      - name: 克隆源码
+        run: |
+          cd /workdir
+          git clone --depth 1 https://github.com/immortalwrt/immortalwrt -b openwrt-24.10 immortalwrt
+
+      - name: 更新与安装 Feeds
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成自定义配置
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          
+          # 1. 基础架构强制指定
+          echo "CONFIG_TARGET_x86=y" > .config
+          echo "CONFIG_TARGET_x86_64=y" >> .config
+          echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
+
+          # 2. 强制开启 EFI 镜像生成
+          echo "CONFIG_GRUB_IMAGES=y" >> .config
+          echo "CONFIG_GRUB_EFI_IMAGES=y" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTITION_EFI=y" >> .config
+          echo "CONFIG_TARGET_IMAGES_GZIP=y" >> .config
+          echo "CONFIG_TARGET_KERNEL_PARTSIZE=64" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=768" >> .config
+
+          # 3. 多拨核心组件：mwan3 + syncdial (并发多拨)
+          echo "CONFIG_PACKAGE_luci-app-mwan3=y" >> .config
+          echo "CONFIG_PACKAGE_mwan3=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-syncdial=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-macvlan=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-ppp=y" >> .config
+
+          # 4. 其他核心插件与网络工具
+          cat >> .config <<EOF
+          CONFIG_PACKAGE_luci-app-passwall=y
+          CONFIG_PACKAGE_luci-app-smartdns=y
+          CONFIG_PACKAGE_luci-app-adguardhome=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_ddns-scripts-cloudflare=y
+          CONFIG_PACKAGE_ipv6helper=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_nano=y
+          CONFIG_PACKAGE_lsblk=y
+          EOF
+
+          # 5. 关键：双重检查，防止 EFI 和 Syncdial 被 defconfig 刷掉
+          make defconfig
+          # 强制补写
+          echo "CONFIG_TARGET_ROOTFS_PARTITION_EFI=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-syncdial=y" >> .config
+          make defconfig
+
+      - name: 下载软件包
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          make download -j8 || make download -j1 V=s
+          find dl -size -1k -exec rm -f {} \;
+
+      - name: 编译固件
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          make -j$(nproc) || make -j1 V=s
+
+      - name: 整理并归档固件
+        run: |
+          cd ${{ env.BUILD_DIR }}/bin/targets/x86/64/
+          ls -lh
+          mkdir -p /tmp/artifact/
+          # 匹配所有包含 combined 的 img.gz 文件 (含 EFI 和 Legacy)
+          cp *combined*.img.gz /tmp/artifact/
+          cp *rootfs.tar.gz /tmp/artifact/ || true
+          echo "FIRMWARE_PATH=/tmp/artifact" >> $GITHUB_ENV
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt_24.10_x86_64_SyncDial_EFI
+          path: ${{ env.FIRMWARE_PATH }}/*
